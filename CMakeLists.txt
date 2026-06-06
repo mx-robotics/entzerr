@@ -23,3 +23,21 @@ target_compile_options(entzerr PRIVATE ${GTK3_CFLAGS_OTHER})
 if(LIB_SOURCES)
   target_link_libraries(entzerr PRIVATE entzerr_lib)
 endif()
+
+include(GNUInstallDirs)
+
+install(TARGETS entzerr
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+)
+
+install(FILES LICENSE
+    DESTINATION ${CMAKE_INSTALL_DOCDIR}
+)
+
+install(FILES res/entzerr.desktop
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/applications
+)
+
+install(FILES res/entzerr.png
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/pixmaps
+)

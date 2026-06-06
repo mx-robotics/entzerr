@@ -190,6 +190,11 @@ static GdkPixbuf *perspective_warp(GdkPixbuf *src, double pts[4][2]) {
 }
 
 // ---------------------------------------------------------------------------
+// Forward declarations
+// ---------------------------------------------------------------------------
+static void update_point_image(AppWidgets *app, int idx);
+
+// ---------------------------------------------------------------------------
 // Source tab — scale & draw
 // ---------------------------------------------------------------------------
 
@@ -514,16 +519,55 @@ static void update_crop(AppWidgets *app, bool switch_tab = true) {
         gtk_notebook_set_current_page(GTK_NOTEBOOK(app->notebook), 1);
 }
 
+static void rotate_source(AppWidgets *app, GdkPixbufRotation rot) {
+    if (!app->original_pixbuf) return;
+    int orig_w = gdk_pixbuf_get_width(app->original_pixbuf);
+    int orig_h = gdk_pixbuf_get_height(app->original_pixbuf);
+
+    GdkPixbuf *rotated = gdk_pixbuf_rotate_simple(app->original_pixbuf, rot);
+    if (!rotated) return;
+    g_object_unref(app->original_pixbuf);
+    app->original_pixbuf = rotated;
+
+    // Transform existing corner points into the new coordinate space.
+    for (int i = 0; i < app->point_count; i++) {
+        double px = app->pts[i][0], py = app->pts[i][1];
+        switch (rot) {
+            case GDK_PIXBUF_ROTATE_COUNTERCLOCKWISE: // visually 90° CCW
+                app->pts[i][0] = py;
+                app->pts[i][1] = orig_w - 1 - px;
+                break;
+            case GDK_PIXBUF_ROTATE_CLOCKWISE:        // visually 90° CW
+                app->pts[i][0] = orig_h - 1 - py;
+                app->pts[i][1] = px;
+                break;
+            case GDK_PIXBUF_ROTATE_UPSIDEDOWN:
+                app->pts[i][0] = orig_w - 1 - px;
+                app->pts[i][1] = orig_h - 1 - py;
+                break;
+            default: break;
+        }
+    }
+
+    update_scale(app);
+    for (int i = 0; i < MAX_POINTS; i++) update_point_image(app, i);
+
+    if (app->point_count == MAX_POINTS) {
+        GdkPixbuf *warped = perspective_warp(app->original_pixbuf, app->pts);
+        if (warped) {
+            if (app->warp_pixbuf) g_object_unref(app->warp_pixbuf);
+            app->warp_pixbuf = warped;
+            recompute_crop(app);
+        }
+    }
+}
+
 static void on_rotate_left(GtkButton *, gpointer data) {
-    AppWidgets *app = static_cast<AppWidgets *>(data);
-    app->crop_rotation = (app->crop_rotation + 270) % 360;
-    recompute_crop(app);
+    rotate_source(static_cast<AppWidgets *>(data), GDK_PIXBUF_ROTATE_COUNTERCLOCKWISE);
 }
 
 static void on_rotate_right(GtkButton *, gpointer data) {
-    AppWidgets *app = static_cast<AppWidgets *>(data);
-    app->crop_rotation = (app->crop_rotation + 90) % 360;
-    recompute_crop(app);
+    rotate_source(static_cast<AppWidgets *>(data), GDK_PIXBUF_ROTATE_CLOCKWISE);
 }
 
 static void on_resize_changed(GtkComboBoxText *combo, gpointer data) {
@@ -1081,6 +1125,14 @@ int main(int argc, char *argv[]) {
     GtkWidget *btn_src_next = gtk_button_new_with_label("Next");
     g_signal_connect(btn_src_next, "clicked", G_CALLBACK(on_next_image), &app);
     gtk_box_pack_end(GTK_BOX(source_bar), btn_src_next, FALSE, FALSE, 0);
+
+    GtkWidget *btn_rotate_left  = gtk_button_new_with_label("↺  Rotate Left");
+    GtkWidget *btn_rotate_right = gtk_button_new_with_label("↻  Rotate Right");
+    g_signal_connect(btn_rotate_left,  "clicked", G_CALLBACK(on_rotate_left),  &app);
+    g_signal_connect(btn_rotate_right, "clicked", G_CALLBACK(on_rotate_right), &app);
+    gtk_box_pack_start(GTK_BOX(source_bar), btn_rotate_left,  FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(source_bar), btn_rotate_right, FALSE, FALSE, 0);
+
     gtk_box_pack_start(GTK_BOX(source_vbox), source_bar, FALSE, FALSE, 0);
 
     gtk_notebook_append_page(GTK_NOTEBOOK(app.notebook), source_vbox,
@@ -1094,16 +1146,6 @@ int main(int argc, char *argv[]) {
     gtk_widget_set_margin_end(toolbar, 4);
     gtk_widget_set_margin_top(toolbar, 4);
     gtk_widget_set_margin_bottom(toolbar, 4);
-
-    GtkWidget *btn_rotate_left  = gtk_button_new_with_label("↺  Rotate Left");
-    GtkWidget *btn_rotate_right = gtk_button_new_with_label("↻  Rotate Right");
-    g_signal_connect(btn_rotate_left,  "clicked", G_CALLBACK(on_rotate_left),  &app);
-    g_signal_connect(btn_rotate_right, "clicked", G_CALLBACK(on_rotate_right), &app);
-    gtk_box_pack_start(GTK_BOX(toolbar), btn_rotate_left,  FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(toolbar), btn_rotate_right, FALSE, FALSE, 0);
-
-    gtk_box_pack_start(GTK_BOX(toolbar),
-                       gtk_separator_new(GTK_ORIENTATION_VERTICAL), FALSE, FALSE, 4);
 
     GtkWidget *btn_gray = gtk_toggle_button_new_with_label("Grayscale");
     g_signal_connect(btn_gray, "toggled", G_CALLBACK(on_grayscale_toggled), &app);

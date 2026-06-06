@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=Entzerr
+GenericName=Perspective Correction Tool
+Comment=Perspective crop and level adjustment for scanned cards and documents
+Exec=entzerr %f
+Icon=entzerr
+Terminal=false
+Type=Application
+Categories=Graphics;Scanning;
+MimeType=image/jpeg;image/png;image/tiff;image/bmp;image/webp;image/x-portable-pixmap;
+Keywords=perspective;crop;scan;card;document;correct;
