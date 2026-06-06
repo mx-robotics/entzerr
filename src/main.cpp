@@ -10,13 +10,21 @@ struct AppWidgets {
     // Source tab
     GtkWidget *drawing_area;
     GtkWidget *scroll;
+    GtkWidget *zoom_area;
+    GtkWidget *combo_zoom;
+    int        zoom_factor;
     GdkPixbuf *original_pixbuf;
     GdkPixbuf *scaled_pixbuf;
+    GdkPixbuf *zoom_pixbuf;
     double     scale;
     int        scaled_w, scaled_h;
     // Crop tab
     GtkWidget *crop_drawing_area;
     GtkWidget *crop_scroll;
+    GtkWidget *point_area[MAX_POINTS];
+    GdkPixbuf *point_pixbuf[MAX_POINTS];
+    GtkWidget *combo_point_radius;
+    int        point_radius;           // pixels around each point shown in thumbnail
     GtkWidget *combo_resize;
     GdkPixbuf *warp_pixbuf;         // raw perspective warp, never modified
     GdkPixbuf *clean_crop_pixbuf;   // warp + rotation + resize, no levels
@@ -481,7 +489,7 @@ static void on_level_changed(GtkRange *, gpointer data) {
     recompute_crop(app);
 }
 
-static void update_crop(AppWidgets *app) {
+static void update_crop(AppWidgets *app, bool switch_tab = true) {
     GdkPixbuf *warped = perspective_warp(app->original_pixbuf, app->pts);
     if (!warped) return;
     if (app->warp_pixbuf) g_object_unref(app->warp_pixbuf);
@@ -502,7 +510,8 @@ static void update_crop(AppWidgets *app) {
         g_signal_handlers_unblock_by_func(app->scale_high, (gpointer)on_level_changed, app);
     }
     recompute_crop(app);
-    gtk_notebook_set_current_page(GTK_NOTEBOOK(app->notebook), 1);
+    if (switch_tab)
+        gtk_notebook_set_current_page(GTK_NOTEBOOK(app->notebook), 1);
 }
 
 static void on_rotate_left(GtkButton *, gpointer data) {
@@ -616,6 +625,135 @@ static void on_save_as(GtkButton *, gpointer data) {
 // Click handler
 // ---------------------------------------------------------------------------
 
+static void update_point_image(AppWidgets *app, int idx) {
+    if (idx < 0 || idx >= MAX_POINTS) return;
+    if (!app->original_pixbuf || idx >= app->point_count) {
+        if (app->point_pixbuf[idx]) { g_object_unref(app->point_pixbuf[idx]); app->point_pixbuf[idx] = nullptr; }
+        if (app->point_area[idx]) gtk_widget_queue_draw(app->point_area[idx]);
+        return;
+    }
+
+    int RADIUS = app->point_radius > 0 ? app->point_radius : 10;
+    int SRC    = RADIUS * 2 + 1;
+
+    int orig_w = gdk_pixbuf_get_width(app->original_pixbuf);
+    int orig_h = gdk_pixbuf_get_height(app->original_pixbuf);
+    int cx = (int)app->pts[idx][0];
+    int cy = (int)app->pts[idx][1];
+
+    int src_x = CLAMP(cx - RADIUS, 0, MAX(0, orig_w - SRC));
+    int src_y = CLAMP(cy - RADIUS, 0, MAX(0, orig_h - SRC));
+    int src_w = MIN(SRC, orig_w - src_x);
+    int src_h = MIN(SRC, orig_h - src_y);
+    if (src_w <= 0 || src_h <= 0) return;
+
+    GdkPixbuf *sub = gdk_pixbuf_new_subpixbuf(app->original_pixbuf, src_x, src_y, src_w, src_h);
+    if (app->point_pixbuf[idx]) g_object_unref(app->point_pixbuf[idx]);
+    // scale to fill the widget (square, size determined at draw time via allocation)
+    int disp = 80;
+    if (app->point_area[idx]) {
+        int aw = gtk_widget_get_allocated_width(app->point_area[idx]);
+        if (aw > 1) disp = aw;
+    }
+    app->point_pixbuf[idx] = gdk_pixbuf_scale_simple(sub, disp, disp, GDK_INTERP_NEAREST);
+    g_object_unref(sub);
+    if (app->point_area[idx]) gtk_widget_queue_draw(app->point_area[idx]);
+}
+
+static gboolean on_point_draw(GtkWidget *widget, cairo_t *cr, gpointer data) {
+    AppWidgets *app = static_cast<AppWidgets *>(data);
+
+    int idx = -1;
+    for (int i = 0; i < MAX_POINTS; i++)
+        if (app->point_area[i] == widget) { idx = i; break; }
+    if (idx < 0) return FALSE;
+
+    int aw = gtk_widget_get_allocated_width(widget);
+    int ah = gtk_widget_get_allocated_height(widget);
+
+    cairo_set_source_rgb(cr, 0.12, 0.12, 0.12);
+    cairo_paint(cr);
+
+    if (app->point_pixbuf[idx]) {
+        gdk_cairo_set_source_pixbuf(cr, app->point_pixbuf[idx], 0, 0);
+        cairo_paint(cr);
+
+        // Crosshair
+        cairo_set_source_rgba(cr, 1.0, 0.2, 0.2, 0.85);
+        cairo_set_line_width(cr, 1.0);
+        cairo_move_to(cr, aw / 2.0, 0); cairo_line_to(cr, aw / 2.0, ah);
+        cairo_move_to(cr, 0, ah / 2.0); cairo_line_to(cr, aw, ah / 2.0);
+        cairo_stroke(cr);
+    }
+
+    // Point number
+    char label[4];
+    g_snprintf(label, sizeof(label), "%d", idx + 1);
+    cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
+    cairo_set_font_size(cr, 13.0);
+    cairo_set_source_rgba(cr, 1.0, 1.0, 0.0, 1.0);
+    cairo_move_to(cr, 4, 16);
+    cairo_show_text(cr, label);
+
+    return FALSE;
+}
+
+static void on_point_radius_changed(GtkComboBoxText *combo, gpointer data) {
+    AppWidgets *app = static_cast<AppWidgets *>(data);
+    char *text = gtk_combo_box_text_get_active_text(combo);
+    if (!text) return;
+    app->point_radius = atoi(text);
+    g_free(text);
+    for (int i = 0; i < MAX_POINTS; i++) update_point_image(app, i);
+}
+
+static gboolean on_point_click(GtkWidget *widget, GdkEventButton *event, gpointer data) {
+    AppWidgets *app = static_cast<AppWidgets *>(data);
+    if (event->button != 1 || !app->original_pixbuf) return FALSE;
+
+    int idx = -1;
+    for (int i = 0; i < MAX_POINTS; i++)
+        if (app->point_area[i] == widget) { idx = i; break; }
+    if (idx < 0 || idx >= app->point_count) return FALSE;
+
+    int RADIUS = app->point_radius > 0 ? app->point_radius : 10;
+    int SRC    = RADIUS * 2 + 1;
+
+    int orig_w = gdk_pixbuf_get_width(app->original_pixbuf);
+    int orig_h = gdk_pixbuf_get_height(app->original_pixbuf);
+    int cx = (int)app->pts[idx][0];
+    int cy = (int)app->pts[idx][1];
+
+    int src_x = CLAMP(cx - RADIUS, 0, MAX(0, orig_w - SRC));
+    int src_y = CLAMP(cy - RADIUS, 0, MAX(0, orig_h - SRC));
+    int src_w = MIN(SRC, orig_w - src_x);
+    int src_h = MIN(SRC, orig_h - src_y);
+
+    int disp_w = gtk_widget_get_allocated_width(widget);
+    int disp_h = gtk_widget_get_allocated_height(widget);
+    if (disp_w <= 0 || disp_h <= 0) return FALSE;
+
+    double new_x = src_x + event->x * src_w / (double)disp_w;
+    double new_y = src_y + event->y * src_h / (double)disp_h;
+    new_x = CLAMP(new_x, 0.0, (double)(orig_w - 1));
+    new_y = CLAMP(new_y, 0.0, (double)(orig_h - 1));
+
+    app->pts[idx][0] = new_x;
+    app->pts[idx][1] = new_y;
+
+    update_point_image(app, idx);
+    gtk_widget_queue_draw(app->drawing_area);
+
+    if (app->point_count == MAX_POINTS)
+        update_crop(app, false);
+
+    char buf[128];
+    g_snprintf(buf, sizeof(buf), "Point %d repositioned: x=%.0f  y=%.0f", idx + 1, new_x, new_y);
+    gtk_label_set_text(GTK_LABEL(app->status_label), buf);
+
+    return TRUE;
+}
+
 static gboolean on_click(GtkWidget *widget, GdkEventButton *event, gpointer data) {
     AppWidgets *app = static_cast<AppWidgets *>(data);
     if (!app->original_pixbuf || event->button != 1) return FALSE;
@@ -640,6 +778,10 @@ static gboolean on_click(GtkWidget *widget, GdkEventButton *event, gpointer data
     app->pts[app->point_count][0] = img_x;
     app->pts[app->point_count][1] = img_y;
     app->point_count++;
+
+    // Update the point thumbnail for the new point; clear any that follow
+    update_point_image(app, app->point_count - 1);
+    for (int i = app->point_count; i < MAX_POINTS; i++) update_point_image(app, i);
 
     char buf[128];
     if (app->point_count < MAX_POINTS)
@@ -669,6 +811,7 @@ static void load_image(AppWidgets *app, const char *filename) {
         if (app->original_pixbuf) g_object_unref(app->original_pixbuf);
         app->original_pixbuf = pixbuf;
         app->point_count = 0;
+        for (int i = 0; i < MAX_POINTS; i++) update_point_image(app, i);
         g_free(app->current_filename);
         app->current_filename = g_strdup(filename);
         gtk_notebook_set_current_page(GTK_NOTEBOOK(app->notebook), 0);
@@ -710,6 +853,141 @@ static void on_open(GtkMenuItem *, gpointer data) {
     gtk_widget_destroy(dialog);
 }
 
+static void update_zoom(AppWidgets *app, double img_x, double img_y) {
+    if (!app->original_pixbuf || !app->zoom_area || app->zoom_factor < 1) return;
+
+    int area_w = gtk_widget_get_allocated_width(app->zoom_area);
+    int area_h = gtk_widget_get_allocated_height(app->zoom_area);
+    if (area_w <= 0 || area_h <= 0) return;
+
+    int orig_w = gdk_pixbuf_get_width(app->original_pixbuf);
+    int orig_h = gdk_pixbuf_get_height(app->original_pixbuf);
+
+    // Square source region based on the smaller display dimension
+    int display = MIN(area_w, area_h);
+    int src_size = MAX(1, display / app->zoom_factor);
+    int src_x = CLAMP((int)img_x - src_size / 2, 0, MAX(0, orig_w - src_size));
+    int src_y = CLAMP((int)img_y - src_size / 2, 0, MAX(0, orig_h - src_size));
+    int src_w = MIN(src_size, orig_w - src_x);
+    int src_h = MIN(src_size, orig_h - src_y);
+    if (src_w <= 0 || src_h <= 0) return;
+
+    GdkPixbuf *sub = gdk_pixbuf_new_subpixbuf(
+        app->original_pixbuf, src_x, src_y, src_w, src_h);
+    if (app->zoom_pixbuf) g_object_unref(app->zoom_pixbuf);
+    app->zoom_pixbuf = gdk_pixbuf_scale_simple(
+        sub, src_w * app->zoom_factor, src_h * app->zoom_factor, GDK_INTERP_NEAREST);
+    g_object_unref(sub);
+
+    gtk_widget_queue_draw(app->zoom_area);
+}
+
+static gboolean on_zoom_draw(GtkWidget *widget, cairo_t *cr, gpointer data) {
+    AppWidgets *app = static_cast<AppWidgets *>(data);
+    if (!app->zoom_pixbuf) return FALSE;
+
+    int aw = gtk_widget_get_allocated_width(widget);
+    int ah = gtk_widget_get_allocated_height(widget);
+    double ox = (aw - gdk_pixbuf_get_width(app->zoom_pixbuf))  / 2.0;
+    double oy = (ah - gdk_pixbuf_get_height(app->zoom_pixbuf)) / 2.0;
+
+    gdk_cairo_set_source_pixbuf(cr, app->zoom_pixbuf, ox, oy);
+    cairo_paint(cr);
+
+    // Crosshair at centre
+    cairo_set_source_rgba(cr, 1.0, 0.2, 0.2, 0.85);
+    cairo_set_line_width(cr, 1.0);
+    cairo_move_to(cr, aw / 2.0, 0);      cairo_line_to(cr, aw / 2.0, ah);
+    cairo_move_to(cr, 0, ah / 2.0);      cairo_line_to(cr, aw, ah / 2.0);
+    cairo_stroke(cr);
+
+    return FALSE;
+}
+
+static gboolean on_motion(GtkWidget *widget, GdkEventMotion *event, gpointer data) {
+    AppWidgets *app = static_cast<AppWidgets *>(data);
+    if (!app->original_pixbuf) return FALSE;
+
+    double ox, oy;
+    center_offset(gtk_widget_get_allocated_width(widget),
+                  gtk_widget_get_allocated_height(widget),
+                  app->scaled_w, app->scaled_h, ox, oy);
+
+    double img_x = (event->x - ox) / app->scale;
+    double img_y = (event->y - oy) / app->scale;
+
+    int orig_w = gdk_pixbuf_get_width(app->original_pixbuf);
+    int orig_h = gdk_pixbuf_get_height(app->original_pixbuf);
+    if (img_x < 0 || img_y < 0 || img_x >= orig_w || img_y >= orig_h) return FALSE;
+
+    update_zoom(app, img_x, img_y);
+    return FALSE;
+}
+
+static void on_zoom_factor_changed(GtkComboBoxText *combo, gpointer data) {
+    AppWidgets *app = static_cast<AppWidgets *>(data);
+    char *text = gtk_combo_box_text_get_active_text(combo);
+    if (text) { app->zoom_factor = atoi(text); g_free(text); }
+}
+
+static void on_next_image(GtkButton *, gpointer data) {
+    AppWidgets *app = static_cast<AppWidgets *>(data);
+    if (!app->current_filename) return;
+
+    char *dir          = g_path_get_dirname(app->current_filename);
+    char *current_base = g_path_get_basename(app->current_filename);
+
+    GDir *gdir = g_dir_open(dir, 0, nullptr);
+    if (!gdir) { g_free(dir); g_free(current_base); return; }
+
+    const char *image_exts[] = {
+        ".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp", ".tiff", ".tif", nullptr
+    };
+
+    GList *files = nullptr;
+    const char *name;
+    while ((name = g_dir_read_name(gdir)) != nullptr) {
+        char *lower = g_ascii_strdown(name, -1);
+        bool is_image = false;
+        for (int i = 0; image_exts[i]; i++) {
+            if (g_str_has_suffix(lower, image_exts[i])) { is_image = true; break; }
+        }
+        if (is_image) {
+            const char *dot = strrchr(lower, '.');
+            char *base = dot ? g_strndup(lower, dot - lower) : g_strdup(lower);
+            bool excluded = g_str_has_suffix(base, "_crop") ||
+                            g_str_has_suffix(base, "-crop") ||
+                            g_str_has_suffix(base, "_org")  ||
+                            g_str_has_suffix(base, "-org");
+            g_free(base);
+            if (!excluded)
+                files = g_list_prepend(files, g_strdup(name));
+        }
+        g_free(lower);
+    }
+    g_dir_close(gdir);
+
+    files = g_list_sort(files, (GCompareFunc)g_strcmp0);
+
+    char *next_file = nullptr;
+    GList *found = g_list_find_custom(files, current_base, (GCompareFunc)g_strcmp0);
+    if (found) {
+        GList *next = found->next ? found->next : files;
+        next_file = g_build_filename(dir, (char *)next->data, nullptr);
+    } else if (files) {
+        next_file = g_build_filename(dir, (char *)files->data, nullptr);
+    }
+
+    g_list_free_full(files, g_free);
+    g_free(dir);
+    g_free(current_base);
+
+    if (next_file) {
+        load_image(app, next_file);
+        g_free(next_file);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
@@ -718,6 +996,10 @@ int main(int argc, char *argv[]) {
     gtk_init(&argc, &argv);
 
     AppWidgets app = {};
+    app.zoom_factor  = 5;
+    app.level_low    = 0;
+    app.level_mid    = 128;
+    app.level_high   = 255;
 
     app.window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
     gtk_window_set_title(GTK_WINDOW(app.window), "Image Viewer");
@@ -748,16 +1030,60 @@ int main(int argc, char *argv[]) {
     gtk_box_pack_start(GTK_BOX(vbox), app.notebook, TRUE, TRUE, 0);
 
     // Tab 1 — Source
+    GtkWidget *source_vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+
+    GtkWidget *source_pane = gtk_paned_new(GTK_ORIENTATION_HORIZONTAL);
+    gtk_box_pack_start(GTK_BOX(source_vbox), source_pane, TRUE, TRUE, 0);
+
     app.scroll = gtk_scrolled_window_new(nullptr, nullptr);
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(app.scroll),
                                    GTK_POLICY_NEVER, GTK_POLICY_NEVER);
     g_signal_connect(app.scroll, "size-allocate", G_CALLBACK(on_scroll_size_allocate), &app);
     app.drawing_area = gtk_drawing_area_new();
-    gtk_widget_add_events(app.drawing_area, GDK_BUTTON_PRESS_MASK);
-    g_signal_connect(app.drawing_area, "draw",               G_CALLBACK(on_draw),  &app);
-    g_signal_connect(app.drawing_area, "button-press-event", G_CALLBACK(on_click), &app);
+    gtk_widget_add_events(app.drawing_area,
+                          GDK_BUTTON_PRESS_MASK | GDK_POINTER_MOTION_MASK);
+    g_signal_connect(app.drawing_area, "draw",                G_CALLBACK(on_draw),   &app);
+    g_signal_connect(app.drawing_area, "button-press-event",  G_CALLBACK(on_click),  &app);
+    g_signal_connect(app.drawing_area, "motion-notify-event", G_CALLBACK(on_motion), &app);
     gtk_container_add(GTK_CONTAINER(app.scroll), app.drawing_area);
-    gtk_notebook_append_page(GTK_NOTEBOOK(app.notebook), app.scroll,
+    gtk_paned_pack1(GTK_PANED(source_pane), app.scroll, TRUE, FALSE);
+
+    GtkWidget *zoom_vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
+    gtk_widget_set_margin_start(zoom_vbox, 4);
+    gtk_widget_set_margin_end(zoom_vbox, 4);
+    gtk_widget_set_margin_top(zoom_vbox, 4);
+    gtk_widget_set_margin_bottom(zoom_vbox, 4);
+
+    app.combo_zoom = gtk_combo_box_text_new();
+    const char *zoom_levels[] = { "2×", "5×", "10×", nullptr };
+    for (int i = 0; zoom_levels[i]; i++)
+        gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(app.combo_zoom), zoom_levels[i]);
+    gtk_combo_box_set_active(GTK_COMBO_BOX(app.combo_zoom), 1); // default 5×
+    g_signal_connect(app.combo_zoom, "changed", G_CALLBACK(on_zoom_factor_changed), &app);
+    gtk_box_pack_start(GTK_BOX(zoom_vbox), app.combo_zoom, FALSE, FALSE, 0);
+
+    GtkWidget *zoom_frame = gtk_frame_new(nullptr);
+    app.zoom_area = gtk_drawing_area_new();
+    gtk_widget_set_size_request(app.zoom_area, 200, 200);
+    g_signal_connect(app.zoom_area, "draw", G_CALLBACK(on_zoom_draw), &app);
+    gtk_container_add(GTK_CONTAINER(zoom_frame), app.zoom_area);
+    gtk_box_pack_start(GTK_BOX(zoom_vbox), zoom_frame, FALSE, FALSE, 0);
+
+    gtk_paned_pack2(GTK_PANED(source_pane), zoom_vbox, FALSE, FALSE);
+
+    gtk_box_pack_start(GTK_BOX(source_vbox),
+                       gtk_separator_new(GTK_ORIENTATION_HORIZONTAL), FALSE, FALSE, 0);
+    GtkWidget *source_bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
+    gtk_widget_set_margin_start(source_bar, 4);
+    gtk_widget_set_margin_end(source_bar, 4);
+    gtk_widget_set_margin_top(source_bar, 4);
+    gtk_widget_set_margin_bottom(source_bar, 4);
+    GtkWidget *btn_src_next = gtk_button_new_with_label("Next");
+    g_signal_connect(btn_src_next, "clicked", G_CALLBACK(on_next_image), &app);
+    gtk_box_pack_end(GTK_BOX(source_bar), btn_src_next, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(source_vbox), source_bar, FALSE, FALSE, 0);
+
+    gtk_notebook_append_page(GTK_NOTEBOOK(app.notebook), source_vbox,
                              gtk_label_new("Source"));
 
     // Tab 2 — Crop
@@ -857,7 +1183,49 @@ int main(int argc, char *argv[]) {
     gtk_container_add(GTK_CONTAINER(levels_frame), levels_grid);
     gtk_box_pack_start(GTK_BOX(hist_vbox), levels_frame, FALSE, FALSE, 0);
 
-    gtk_paned_pack2(GTK_PANED(content_pane), hist_vbox, FALSE, FALSE);
+    // Point thumbnails column (4 × thumbnails + radius selector above)
+    GtkWidget *points_vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
+    gtk_widget_set_margin_start(points_vbox, 4);
+    gtk_widget_set_margin_end(points_vbox, 4);
+    gtk_widget_set_margin_top(points_vbox, 4);
+    gtk_widget_set_margin_bottom(points_vbox, 4);
+
+    // Radius selector
+    app.point_radius = 50;
+    GtkWidget *radius_hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
+    GtkWidget *radius_label = gtk_label_new("Area:");
+    gtk_box_pack_start(GTK_BOX(radius_hbox), radius_label, FALSE, FALSE, 0);
+    app.combo_point_radius = gtk_combo_box_text_new();
+    const char *radii[] = { "10", "20", "40", "50", "100", nullptr };
+    for (int i = 0; radii[i]; i++)
+        gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(app.combo_point_radius), radii[i]);
+    gtk_combo_box_set_active(GTK_COMBO_BOX(app.combo_point_radius), 3); // default 50 px
+    g_signal_connect(app.combo_point_radius, "changed", G_CALLBACK(on_point_radius_changed), &app);
+    gtk_box_pack_start(GTK_BOX(radius_hbox), app.combo_point_radius, TRUE, TRUE, 0);
+    GtkWidget *px_label = gtk_label_new("px");
+    gtk_box_pack_start(GTK_BOX(radius_hbox), px_label, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(points_vbox), radius_hbox, FALSE, FALSE, 0);
+
+    for (int i = 0; i < MAX_POINTS; i++) {
+        char lbl[16];
+        g_snprintf(lbl, sizeof(lbl), "Point %d", i + 1);
+        GtkWidget *pframe = gtk_frame_new(lbl);
+        app.point_area[i] = gtk_drawing_area_new();
+        gtk_widget_set_size_request(app.point_area[i], 80, 80);
+        gtk_widget_add_events(app.point_area[i], GDK_BUTTON_PRESS_MASK);
+        g_signal_connect(app.point_area[i], "draw",               G_CALLBACK(on_point_draw),  &app);
+        g_signal_connect(app.point_area[i], "button-press-event", G_CALLBACK(on_point_click), &app);
+        gtk_container_add(GTK_CONTAINER(pframe), app.point_area[i]);
+        gtk_box_pack_start(GTK_BOX(points_vbox), pframe, FALSE, FALSE, 0);
+    }
+
+    GtkWidget *right_panel = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    gtk_box_pack_start(GTK_BOX(right_panel), points_vbox, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(right_panel),
+                       gtk_separator_new(GTK_ORIENTATION_VERTICAL), FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(right_panel), hist_vbox, FALSE, FALSE, 0);
+
+    gtk_paned_pack2(GTK_PANED(content_pane), right_panel, FALSE, FALSE);
 
     GtkWidget *savebar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
     gtk_widget_set_margin_start(savebar, 4);
@@ -868,6 +1236,11 @@ int main(int argc, char *argv[]) {
     GtkWidget *btn_save_as      = gtk_button_new_with_label("Save as");
     g_signal_connect(btn_save_replace, "clicked", G_CALLBACK(on_save_replace), &app);
     g_signal_connect(btn_save_as,      "clicked", G_CALLBACK(on_save_as),      &app);
+    GtkWidget *btn_next = gtk_button_new_with_label("Next");
+    g_signal_connect(btn_next, "clicked", G_CALLBACK(on_next_image), &app);
+    gtk_box_pack_end(GTK_BOX(savebar), btn_next,         FALSE, FALSE, 0);
+    gtk_box_pack_end(GTK_BOX(savebar),
+                     gtk_separator_new(GTK_ORIENTATION_VERTICAL), FALSE, FALSE, 4);
     gtk_box_pack_end(GTK_BOX(savebar), btn_save_as,      FALSE, FALSE, 0);
     gtk_box_pack_end(GTK_BOX(savebar), btn_save_replace, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(crop_vbox),
@@ -896,8 +1269,11 @@ int main(int argc, char *argv[]) {
 
     gtk_main();
 
+    for (int i = 0; i < MAX_POINTS; i++)
+        if (app.point_pixbuf[i]) g_object_unref(app.point_pixbuf[i]);
     if (app.original_pixbuf)    g_object_unref(app.original_pixbuf);
     if (app.scaled_pixbuf)      g_object_unref(app.scaled_pixbuf);
+    if (app.zoom_pixbuf)        g_object_unref(app.zoom_pixbuf);
     if (app.warp_pixbuf)        g_object_unref(app.warp_pixbuf);
     if (app.clean_crop_pixbuf)  g_object_unref(app.clean_crop_pixbuf);
     if (app.crop_pixbuf)        g_object_unref(app.crop_pixbuf);
