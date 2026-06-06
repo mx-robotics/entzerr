@@ -17,12 +17,17 @@ struct AppWidgets {
     // Crop tab
     GtkWidget *crop_drawing_area;
     GtkWidget *crop_scroll;
-    GdkPixbuf *crop_pixbuf;
+    GtkWidget *combo_resize;
+    GdkPixbuf *warp_pixbuf;         // raw perspective warp, never modified
+    GdkPixbuf *crop_pixbuf;         // warp + rotation + resize applied
     GdkPixbuf *crop_scaled_pixbuf;
     double     crop_scale;
     int        crop_scaled_w, crop_scaled_h;
+    int        crop_rotation;       // 0 / 90 / 180 / 270
+    int        resize_width;        // 0 = original
     // Shared
     GtkWidget *status_label;
+    char      *current_filename;
     double     pts[MAX_POINTS][2];   // original image coordinates
     int        point_count;
 };
@@ -267,13 +272,154 @@ static gboolean on_crop_draw(GtkWidget *widget, cairo_t *cr, gpointer data) {
     return FALSE;
 }
 
+static void recompute_crop(AppWidgets *app) {
+    if (!app->warp_pixbuf) return;
+
+    GdkPixbuf *tmp = app->warp_pixbuf;
+    g_object_ref(tmp);
+
+    if (app->crop_rotation != 0) {
+        GdkPixbufRotation rot;
+        switch (app->crop_rotation) {
+            case  90: rot = GDK_PIXBUF_ROTATE_CLOCKWISE;        break;
+            case 180: rot = GDK_PIXBUF_ROTATE_UPSIDEDOWN;       break;
+            default:  rot = GDK_PIXBUF_ROTATE_COUNTERCLOCKWISE; break;
+        }
+        GdkPixbuf *rotated = gdk_pixbuf_rotate_simple(tmp, rot);
+        g_object_unref(tmp);
+        tmp = rotated;
+    }
+
+    if (app->resize_width > 0 && tmp) {
+        int w = gdk_pixbuf_get_width(tmp);
+        int h = gdk_pixbuf_get_height(tmp);
+        int new_h = MAX(1, (int)((double)h * app->resize_width / w));
+        GdkPixbuf *resized = gdk_pixbuf_scale_simple(tmp, app->resize_width, new_h,
+                                                      GDK_INTERP_BILINEAR);
+        g_object_unref(tmp);
+        tmp = resized;
+    }
+
+    if (app->crop_pixbuf) g_object_unref(app->crop_pixbuf);
+    app->crop_pixbuf = tmp;
+    update_crop_display(app);
+}
+
 static void update_crop(AppWidgets *app) {
     GdkPixbuf *warped = perspective_warp(app->original_pixbuf, app->pts);
     if (!warped) return;
-    if (app->crop_pixbuf) g_object_unref(app->crop_pixbuf);
-    app->crop_pixbuf = warped;
-    update_crop_display(app);
+    if (app->warp_pixbuf) g_object_unref(app->warp_pixbuf);
+    app->warp_pixbuf = warped;
+    app->crop_rotation = 0;
+    recompute_crop(app);
     gtk_notebook_set_current_page(GTK_NOTEBOOK(app->notebook), 1);
+}
+
+static void on_rotate_left(GtkButton *, gpointer data) {
+    AppWidgets *app = static_cast<AppWidgets *>(data);
+    app->crop_rotation = (app->crop_rotation + 270) % 360;
+    recompute_crop(app);
+}
+
+static void on_rotate_right(GtkButton *, gpointer data) {
+    AppWidgets *app = static_cast<AppWidgets *>(data);
+    app->crop_rotation = (app->crop_rotation + 90) % 360;
+    recompute_crop(app);
+}
+
+static void on_resize_changed(GtkComboBoxText *combo, gpointer data) {
+    AppWidgets *app = static_cast<AppWidgets *>(data);
+    char *text = gtk_combo_box_text_get_active_text(combo);
+    if (!text) return;
+    app->resize_width = (g_strcmp0(text, "Original") == 0) ? 0 : atoi(text);
+    g_free(text);
+    recompute_crop(app);
+}
+
+// ---------------------------------------------------------------------------
+// Save helpers
+// ---------------------------------------------------------------------------
+
+static const char *format_from_filename(const char *filename) {
+    const char *ext = strrchr(filename, '.');
+    if (!ext) return "png";
+    ext++;
+    if (g_ascii_strcasecmp(ext, "jpg") == 0 || g_ascii_strcasecmp(ext, "jpeg") == 0) return "jpeg";
+    if (g_ascii_strcasecmp(ext, "png")  == 0) return "png";
+    if (g_ascii_strcasecmp(ext, "bmp")  == 0) return "bmp";
+    if (g_ascii_strcasecmp(ext, "tiff") == 0 || g_ascii_strcasecmp(ext, "tif") == 0) return "tiff";
+    return "png";
+}
+
+static char *make_suffixed_filename(const char *filename, const char *suffix) {
+    const char *dot = strrchr(filename, '.');
+    if (!dot) return g_strdup_printf("%s%s", filename, suffix);
+    char *base = g_strndup(filename, dot - filename);
+    char *result = g_strdup_printf("%s%s%s", base, suffix, dot);
+    g_free(base);
+    return result;
+}
+
+static char *make_crop_filename(const char *filename) {
+    return make_suffixed_filename(filename, "_crop");
+}
+
+static void save_pixbuf_to(AppWidgets *app, GdkPixbuf *pixbuf, const char *filename) {
+    const char *fmt = format_from_filename(filename);
+    GError *error = nullptr;
+    gboolean ok;
+    if (g_strcmp0(fmt, "jpeg") == 0)
+        ok = gdk_pixbuf_save(pixbuf, filename, fmt, &error, "quality", "95", nullptr);
+    else
+        ok = gdk_pixbuf_save(pixbuf, filename, fmt, &error, nullptr);
+
+    if (ok) {
+        char buf[256];
+        g_snprintf(buf, sizeof(buf), "Saved: %s", g_path_get_basename(filename));
+        gtk_label_set_text(GTK_LABEL(app->status_label), buf);
+    } else {
+        GtkWidget *dlg = gtk_message_dialog_new(GTK_WINDOW(app->window),
+            GTK_DIALOG_MODAL, GTK_MESSAGE_ERROR, GTK_BUTTONS_OK,
+            "Save failed: %s", error ? error->message : "unknown error");
+        gtk_dialog_run(GTK_DIALOG(dlg));
+        gtk_widget_destroy(dlg);
+        if (error) g_error_free(error);
+    }
+}
+
+static void on_save_replace(GtkButton *, gpointer data) {
+    AppWidgets *app = static_cast<AppWidgets *>(data);
+    if (!app->crop_pixbuf || !app->current_filename) return;
+    char *org_filename = make_suffixed_filename(app->current_filename, "-org");
+    save_pixbuf_to(app, app->original_pixbuf, org_filename);
+    g_free(org_filename);
+    save_pixbuf_to(app, app->crop_pixbuf, app->current_filename);
+}
+
+static void on_save_as(GtkButton *, gpointer data) {
+    AppWidgets *app = static_cast<AppWidgets *>(data);
+    if (!app->crop_pixbuf) return;
+
+    GtkWidget *dialog = gtk_file_chooser_dialog_new(
+        "Save Cropped Image", GTK_WINDOW(app->window), GTK_FILE_CHOOSER_ACTION_SAVE,
+        "_Cancel", GTK_RESPONSE_CANCEL, "_Save", GTK_RESPONSE_ACCEPT, nullptr);
+    gtk_file_chooser_set_do_overwrite_confirmation(GTK_FILE_CHOOSER(dialog), TRUE);
+
+    if (app->current_filename) {
+        char *suggested = make_crop_filename(app->current_filename);
+        gtk_file_chooser_set_current_folder(GTK_FILE_CHOOSER(dialog),
+                                            g_path_get_dirname(app->current_filename));
+        gtk_file_chooser_set_current_name(GTK_FILE_CHOOSER(dialog),
+                                          g_path_get_basename(suggested));
+        g_free(suggested);
+    }
+
+    if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_ACCEPT) {
+        char *filename = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(dialog));
+        save_pixbuf_to(app, app->crop_pixbuf, filename);
+        g_free(filename);
+    }
+    gtk_widget_destroy(dialog);
 }
 
 // ---------------------------------------------------------------------------
@@ -333,6 +479,8 @@ static void load_image(AppWidgets *app, const char *filename) {
         if (app->original_pixbuf) g_object_unref(app->original_pixbuf);
         app->original_pixbuf = pixbuf;
         app->point_count = 0;
+        g_free(app->current_filename);
+        app->current_filename = g_strdup(filename);
         gtk_notebook_set_current_page(GTK_NOTEBOOK(app->notebook), 0);
         update_scale(app);
         gtk_window_set_title(GTK_WINDOW(app->window), g_path_get_basename(filename));
@@ -423,6 +571,37 @@ int main(int argc, char *argv[]) {
                              gtk_label_new("Source"));
 
     // Tab 2 — Crop
+    GtkWidget *crop_vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+
+    GtkWidget *toolbar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
+    gtk_widget_set_margin_start(toolbar, 4);
+    gtk_widget_set_margin_end(toolbar, 4);
+    gtk_widget_set_margin_top(toolbar, 4);
+    gtk_widget_set_margin_bottom(toolbar, 4);
+
+    GtkWidget *btn_rotate_left  = gtk_button_new_with_label("↺  Rotate Left");
+    GtkWidget *btn_rotate_right = gtk_button_new_with_label("↻  Rotate Right");
+    g_signal_connect(btn_rotate_left,  "clicked", G_CALLBACK(on_rotate_left),  &app);
+    g_signal_connect(btn_rotate_right, "clicked", G_CALLBACK(on_rotate_right), &app);
+    gtk_box_pack_start(GTK_BOX(toolbar), btn_rotate_left,  FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(toolbar), btn_rotate_right, FALSE, FALSE, 0);
+
+    gtk_box_pack_start(GTK_BOX(toolbar),
+                       gtk_separator_new(GTK_ORIENTATION_VERTICAL), FALSE, FALSE, 4);
+
+    gtk_box_pack_start(GTK_BOX(toolbar), gtk_label_new("Resize:"), FALSE, FALSE, 0);
+
+    app.combo_resize = gtk_combo_box_text_new();
+    const char *sizes[] = { "400 px", "500 px", "800 px", "1000 px", "1500 px", "Original", nullptr };
+    for (int i = 0; sizes[i]; i++)
+        gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(app.combo_resize), sizes[i]);
+    gtk_combo_box_set_active(GTK_COMBO_BOX(app.combo_resize), 5); // Original
+    g_signal_connect(app.combo_resize, "changed", G_CALLBACK(on_resize_changed), &app);
+    gtk_box_pack_start(GTK_BOX(toolbar), app.combo_resize, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(crop_vbox), toolbar, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(crop_vbox),
+                       gtk_separator_new(GTK_ORIENTATION_HORIZONTAL), FALSE, FALSE, 0);
+
     app.crop_scroll = gtk_scrolled_window_new(nullptr, nullptr);
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(app.crop_scroll),
                                    GTK_POLICY_NEVER, GTK_POLICY_NEVER);
@@ -431,7 +610,24 @@ int main(int argc, char *argv[]) {
     app.crop_drawing_area = gtk_drawing_area_new();
     g_signal_connect(app.crop_drawing_area, "draw", G_CALLBACK(on_crop_draw), &app);
     gtk_container_add(GTK_CONTAINER(app.crop_scroll), app.crop_drawing_area);
-    gtk_notebook_append_page(GTK_NOTEBOOK(app.notebook), app.crop_scroll,
+    gtk_box_pack_start(GTK_BOX(crop_vbox), app.crop_scroll, TRUE, TRUE, 0);
+
+    GtkWidget *savebar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
+    gtk_widget_set_margin_start(savebar, 4);
+    gtk_widget_set_margin_end(savebar, 4);
+    gtk_widget_set_margin_top(savebar, 4);
+    gtk_widget_set_margin_bottom(savebar, 4);
+    GtkWidget *btn_save_replace = gtk_button_new_with_label("Replace");
+    GtkWidget *btn_save_as      = gtk_button_new_with_label("Save as");
+    g_signal_connect(btn_save_replace, "clicked", G_CALLBACK(on_save_replace), &app);
+    g_signal_connect(btn_save_as,      "clicked", G_CALLBACK(on_save_as),      &app);
+    gtk_box_pack_end(GTK_BOX(savebar), btn_save_as,      FALSE, FALSE, 0);
+    gtk_box_pack_end(GTK_BOX(savebar), btn_save_replace, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(crop_vbox),
+                       gtk_separator_new(GTK_ORIENTATION_HORIZONTAL), FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(crop_vbox), savebar, FALSE, FALSE, 0);
+
+    gtk_notebook_append_page(GTK_NOTEBOOK(app.notebook), crop_vbox,
                              gtk_label_new("Crop"));
 
     // Status bar
@@ -453,10 +649,12 @@ int main(int argc, char *argv[]) {
 
     gtk_main();
 
-    if (app.original_pixbuf)   g_object_unref(app.original_pixbuf);
-    if (app.scaled_pixbuf)     g_object_unref(app.scaled_pixbuf);
-    if (app.crop_pixbuf)       g_object_unref(app.crop_pixbuf);
+    if (app.original_pixbuf)    g_object_unref(app.original_pixbuf);
+    if (app.scaled_pixbuf)      g_object_unref(app.scaled_pixbuf);
+    if (app.warp_pixbuf)        g_object_unref(app.warp_pixbuf);
+    if (app.crop_pixbuf)        g_object_unref(app.crop_pixbuf);
     if (app.crop_scaled_pixbuf) g_object_unref(app.crop_scaled_pixbuf);
+    g_free(app.current_filename);
 
     return 0;
 }
