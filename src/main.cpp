@@ -19,12 +19,25 @@ struct AppWidgets {
     GtkWidget *crop_scroll;
     GtkWidget *combo_resize;
     GdkPixbuf *warp_pixbuf;         // raw perspective warp, never modified
-    GdkPixbuf *crop_pixbuf;         // warp + rotation + resize applied
+    GdkPixbuf *clean_crop_pixbuf;   // warp + rotation + resize, no levels
+    GdkPixbuf *crop_pixbuf;         // clean + levels applied (display + save)
     GdkPixbuf *crop_scaled_pixbuf;
     double     crop_scale;
     int        crop_scaled_w, crop_scaled_h;
     int        crop_rotation;       // 0 / 90 / 180 / 270
     int        resize_width;        // 0 = original
+    bool       grayscale;
+    // Histogram + levels
+    GtkWidget *hist_area;
+    int        hist_r[256];
+    int        hist_g[256];
+    int        hist_b[256];
+    GtkWidget *scale_low;
+    GtkWidget *scale_mid;
+    GtkWidget *scale_high;
+    int        level_low;           // input black point  0-254
+    int        level_mid;           // input mid point    1-254
+    int        level_high;          // input white point  1-255
     // Shared
     GtkWidget *status_label;
     char      *current_filename;
@@ -272,6 +285,142 @@ static gboolean on_crop_draw(GtkWidget *widget, cairo_t *cr, gpointer data) {
     return FALSE;
 }
 
+static GdkPixbuf *apply_levels(GdkPixbuf *src, int low, int mid, int high) {
+    low  = MAX(0,       MIN(253, low));
+    high = MAX(low + 2, MIN(255, high));
+    mid  = MAX(low + 1, MIN(high - 1, mid));
+
+    double mid_frac = (double)(mid - low) / (high - low);
+    mid_frac = MAX(1e-4, MIN(1.0 - 1e-4, mid_frac));
+    double gamma = log(0.5) / log(mid_frac);
+
+    guchar lut[256];
+    for (int i = 0; i < 256; i++) {
+        double v = (i - low) / (double)(high - low);
+        v = MAX(0.0, MIN(1.0, v));
+        lut[i] = (guchar)(pow(v, gamma) * 255.0 + 0.5);
+    }
+
+    int w      = gdk_pixbuf_get_width(src);
+    int h      = gdk_pixbuf_get_height(src);
+    int ch     = gdk_pixbuf_get_n_channels(src);
+    int stride = gdk_pixbuf_get_rowstride(src);
+    GdkPixbuf *dst = gdk_pixbuf_copy(src);
+    guchar *px = gdk_pixbuf_get_pixels(dst);
+    for (int y = 0; y < h; y++) {
+        guchar *row = px + y * stride;
+        for (int x = 0; x < w; x++)
+            for (int c = 0; c < MIN(ch, 3); c++)
+                row[x * ch + c] = lut[row[x * ch + c]];
+    }
+    return dst;
+}
+
+static GdkPixbuf *apply_grayscale(GdkPixbuf *src) {
+    GdkPixbuf *dst = gdk_pixbuf_copy(src);
+    int w      = gdk_pixbuf_get_width(dst);
+    int h      = gdk_pixbuf_get_height(dst);
+    int ch     = gdk_pixbuf_get_n_channels(dst);
+    int stride = gdk_pixbuf_get_rowstride(dst);
+    guchar *px = gdk_pixbuf_get_pixels(dst);
+    for (int y = 0; y < h; y++) {
+        guchar *row = px + y * stride;
+        for (int x = 0; x < w; x++) {
+            guchar *p = row + x * ch;
+            guchar lum = (guchar)(0.299 * p[0] + 0.587 * p[1] + 0.114 * p[2] + 0.5);
+            p[0] = p[1] = p[2] = lum;
+        }
+    }
+    return dst;
+}
+
+static void compute_histogram(AppWidgets *app) {
+    memset(app->hist_r, 0, sizeof(app->hist_r));
+    memset(app->hist_g, 0, sizeof(app->hist_g));
+    memset(app->hist_b, 0, sizeof(app->hist_b));
+    if (!app->clean_crop_pixbuf) return;
+
+    int ch     = gdk_pixbuf_get_n_channels(app->clean_crop_pixbuf);
+    int stride = gdk_pixbuf_get_rowstride(app->clean_crop_pixbuf);
+    int w      = gdk_pixbuf_get_width(app->clean_crop_pixbuf);
+    int h      = gdk_pixbuf_get_height(app->clean_crop_pixbuf);
+    const guchar *px = gdk_pixbuf_get_pixels(app->clean_crop_pixbuf);
+
+    for (int y = 0; y < h; y++) {
+        const guchar *row = px + y * stride;
+        for (int x = 0; x < w; x++) {
+            app->hist_r[row[x * ch + 0]]++;
+            app->hist_g[row[x * ch + 1]]++;
+            app->hist_b[row[x * ch + 2]]++;
+        }
+    }
+}
+
+static gboolean on_hist_draw(GtkWidget *widget, cairo_t *cr, gpointer data) {
+    AppWidgets *app = static_cast<AppWidgets *>(data);
+
+    int aw = gtk_widget_get_allocated_width(widget);
+    int ah = gtk_widget_get_allocated_height(widget);
+
+    // Background
+    cairo_set_source_rgb(cr, 0.12, 0.12, 0.12);
+    cairo_paint(cr);
+
+    if (!app->crop_pixbuf) return FALSE;
+
+    // Find global max for normalisation
+    int max_val = 1;
+    for (int i = 0; i < 256; i++) {
+        max_val = MAX(max_val, app->hist_r[i]);
+        max_val = MAX(max_val, app->hist_g[i]);
+        max_val = MAX(max_val, app->hist_b[i]);
+    }
+
+    const int pad = 4;
+    double plot_w = aw - 2 * pad;
+    double plot_h = ah - 2 * pad;
+    double bin_w  = plot_w / 256.0;
+
+    struct { int *data; double r, g, b; } channels[3] = {
+        { app->hist_r, 0.9, 0.2, 0.2 },
+        { app->hist_g, 0.2, 0.85, 0.2 },
+        { app->hist_b, 0.3, 0.55, 1.0 },
+    };
+
+    for (auto &ch : channels) {
+        cairo_set_source_rgba(cr, ch.r, ch.g, ch.b, 0.55);
+        for (int i = 0; i < 256; i++) {
+            double bar_h = (double)ch.data[i] / max_val * plot_h;
+            double x     = pad + i * bin_w;
+            cairo_rectangle(cr, x, pad + plot_h - bar_h, MAX(1.0, bin_w), bar_h);
+        }
+        cairo_fill(cr);
+    }
+
+    // Level marker lines
+    struct { int val; double r, g, b; } markers[3] = {
+        { app->level_low,  1.0, 1.0, 0.0 },
+        { app->level_mid,  0.8, 0.8, 0.8 },
+        { app->level_high, 1.0, 1.0, 0.0 },
+    };
+    cairo_set_line_width(cr, 1.5);
+    for (auto &m : markers) {
+        double x = pad + (double)m.val / 255.0 * plot_w;
+        cairo_set_source_rgba(cr, m.r, m.g, m.b, 0.9);
+        cairo_move_to(cr, x, pad);
+        cairo_line_to(cr, x, pad + plot_h);
+        cairo_stroke(cr);
+    }
+
+    // Border
+    cairo_set_source_rgba(cr, 0.4, 0.4, 0.4, 1.0);
+    cairo_set_line_width(cr, 1.0);
+    cairo_rectangle(cr, pad, pad, plot_w, plot_h);
+    cairo_stroke(cr);
+
+    return FALSE;
+}
+
 static void recompute_crop(AppWidgets *app) {
     if (!app->warp_pixbuf) return;
 
@@ -300,17 +449,58 @@ static void recompute_crop(AppWidgets *app) {
         tmp = resized;
     }
 
+    if (app->grayscale) {
+        GdkPixbuf *gray = apply_grayscale(tmp);
+        g_object_unref(tmp);
+        tmp = gray;
+    }
+
+    if (app->clean_crop_pixbuf) g_object_unref(app->clean_crop_pixbuf);
+    app->clean_crop_pixbuf = tmp;
+
+    GdkPixbuf *leveled = apply_levels(tmp, app->level_low, app->level_mid, app->level_high);
     if (app->crop_pixbuf) g_object_unref(app->crop_pixbuf);
-    app->crop_pixbuf = tmp;
+    app->crop_pixbuf = leveled;
+
     update_crop_display(app);
+    compute_histogram(app);
+    if (app->hist_area) gtk_widget_queue_draw(app->hist_area);
+}
+
+static void on_grayscale_toggled(GtkToggleButton *btn, gpointer data) {
+    AppWidgets *app = static_cast<AppWidgets *>(data);
+    app->grayscale = gtk_toggle_button_get_active(btn);
+    recompute_crop(app);
+}
+
+static void on_level_changed(GtkRange *, gpointer data) {
+    AppWidgets *app = static_cast<AppWidgets *>(data);
+    app->level_low  = (int)gtk_range_get_value(GTK_RANGE(app->scale_low));
+    app->level_mid  = (int)gtk_range_get_value(GTK_RANGE(app->scale_mid));
+    app->level_high = (int)gtk_range_get_value(GTK_RANGE(app->scale_high));
+    recompute_crop(app);
 }
 
 static void update_crop(AppWidgets *app) {
     GdkPixbuf *warped = perspective_warp(app->original_pixbuf, app->pts);
     if (!warped) return;
     if (app->warp_pixbuf) g_object_unref(app->warp_pixbuf);
-    app->warp_pixbuf = warped;
+    app->warp_pixbuf   = warped;
     app->crop_rotation = 0;
+    app->level_low     = 0;
+    app->level_mid     = 128;
+    app->level_high    = 255;
+    if (app->scale_low) {
+        g_signal_handlers_block_by_func(app->scale_low,  (gpointer)on_level_changed, app);
+        g_signal_handlers_block_by_func(app->scale_mid,  (gpointer)on_level_changed, app);
+        g_signal_handlers_block_by_func(app->scale_high, (gpointer)on_level_changed, app);
+        gtk_range_set_value(GTK_RANGE(app->scale_low),  0);
+        gtk_range_set_value(GTK_RANGE(app->scale_mid),  128);
+        gtk_range_set_value(GTK_RANGE(app->scale_high), 255);
+        g_signal_handlers_unblock_by_func(app->scale_low,  (gpointer)on_level_changed, app);
+        g_signal_handlers_unblock_by_func(app->scale_mid,  (gpointer)on_level_changed, app);
+        g_signal_handlers_unblock_by_func(app->scale_high, (gpointer)on_level_changed, app);
+    }
     recompute_crop(app);
     gtk_notebook_set_current_page(GTK_NOTEBOOK(app->notebook), 1);
 }
@@ -589,6 +779,13 @@ int main(int argc, char *argv[]) {
     gtk_box_pack_start(GTK_BOX(toolbar),
                        gtk_separator_new(GTK_ORIENTATION_VERTICAL), FALSE, FALSE, 4);
 
+    GtkWidget *btn_gray = gtk_toggle_button_new_with_label("Grayscale");
+    g_signal_connect(btn_gray, "toggled", G_CALLBACK(on_grayscale_toggled), &app);
+    gtk_box_pack_start(GTK_BOX(toolbar), btn_gray, FALSE, FALSE, 0);
+
+    gtk_box_pack_start(GTK_BOX(toolbar),
+                       gtk_separator_new(GTK_ORIENTATION_VERTICAL), FALSE, FALSE, 4);
+
     gtk_box_pack_start(GTK_BOX(toolbar), gtk_label_new("Resize:"), FALSE, FALSE, 0);
 
     app.combo_resize = gtk_combo_box_text_new();
@@ -602,6 +799,9 @@ int main(int argc, char *argv[]) {
     gtk_box_pack_start(GTK_BOX(crop_vbox),
                        gtk_separator_new(GTK_ORIENTATION_HORIZONTAL), FALSE, FALSE, 0);
 
+    GtkWidget *content_pane = gtk_paned_new(GTK_ORIENTATION_HORIZONTAL);
+    gtk_box_pack_start(GTK_BOX(crop_vbox), content_pane, TRUE, TRUE, 0);
+
     app.crop_scroll = gtk_scrolled_window_new(nullptr, nullptr);
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(app.crop_scroll),
                                    GTK_POLICY_NEVER, GTK_POLICY_NEVER);
@@ -610,7 +810,54 @@ int main(int argc, char *argv[]) {
     app.crop_drawing_area = gtk_drawing_area_new();
     g_signal_connect(app.crop_drawing_area, "draw", G_CALLBACK(on_crop_draw), &app);
     gtk_container_add(GTK_CONTAINER(app.crop_scroll), app.crop_drawing_area);
-    gtk_box_pack_start(GTK_BOX(crop_vbox), app.crop_scroll, TRUE, TRUE, 0);
+    gtk_paned_pack1(GTK_PANED(content_pane), app.crop_scroll, TRUE, FALSE);
+
+    GtkWidget *hist_vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
+    gtk_widget_set_margin_start(hist_vbox, 4);
+    gtk_widget_set_margin_end(hist_vbox, 4);
+    gtk_widget_set_margin_top(hist_vbox, 4);
+    gtk_widget_set_margin_bottom(hist_vbox, 4);
+    gtk_widget_set_size_request(hist_vbox, 220, -1);
+
+    GtkWidget *hist_frame = gtk_frame_new("Histogram");
+    app.hist_area = gtk_drawing_area_new();
+    g_signal_connect(app.hist_area, "draw", G_CALLBACK(on_hist_draw), &app);
+    gtk_container_add(GTK_CONTAINER(hist_frame), app.hist_area);
+    gtk_box_pack_start(GTK_BOX(hist_vbox), hist_frame, TRUE, TRUE, 0);
+
+    GtkWidget *levels_frame = gtk_frame_new("Levels");
+    GtkWidget *levels_grid = gtk_grid_new();
+    gtk_grid_set_column_spacing(GTK_GRID(levels_grid), 4);
+    gtk_grid_set_row_spacing(GTK_GRID(levels_grid), 2);
+    gtk_widget_set_margin_start(levels_grid, 4);
+    gtk_widget_set_margin_end(levels_grid, 4);
+    gtk_widget_set_margin_top(levels_grid, 4);
+    gtk_widget_set_margin_bottom(levels_grid, 4);
+
+    struct { const char *label; GtkWidget **scale; double val; } level_rows[3] = {
+        { "Low",  &app.scale_low,  0   },
+        { "Mid",  &app.scale_mid,  128 },
+        { "High", &app.scale_high, 255 },
+    };
+    for (int i = 0; i < 3; i++) {
+        GtkWidget *lbl = gtk_label_new(level_rows[i].label);
+        gtk_label_set_xalign(GTK_LABEL(lbl), 1.0);
+        gtk_grid_attach(GTK_GRID(levels_grid), lbl, 0, i, 1, 1);
+
+        *level_rows[i].scale = gtk_scale_new_with_range(
+            GTK_ORIENTATION_HORIZONTAL, 0, 255, 1);
+        gtk_scale_set_draw_value(GTK_SCALE(*level_rows[i].scale), TRUE);
+        gtk_scale_set_value_pos(GTK_SCALE(*level_rows[i].scale), GTK_POS_RIGHT);
+        gtk_range_set_value(GTK_RANGE(*level_rows[i].scale), level_rows[i].val);
+        gtk_widget_set_hexpand(*level_rows[i].scale, TRUE);
+        g_signal_connect(*level_rows[i].scale, "value-changed",
+                         G_CALLBACK(on_level_changed), &app);
+        gtk_grid_attach(GTK_GRID(levels_grid), *level_rows[i].scale, 1, i, 1, 1);
+    }
+    gtk_container_add(GTK_CONTAINER(levels_frame), levels_grid);
+    gtk_box_pack_start(GTK_BOX(hist_vbox), levels_frame, FALSE, FALSE, 0);
+
+    gtk_paned_pack2(GTK_PANED(content_pane), hist_vbox, FALSE, FALSE);
 
     GtkWidget *savebar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
     gtk_widget_set_margin_start(savebar, 4);
@@ -652,6 +899,7 @@ int main(int argc, char *argv[]) {
     if (app.original_pixbuf)    g_object_unref(app.original_pixbuf);
     if (app.scaled_pixbuf)      g_object_unref(app.scaled_pixbuf);
     if (app.warp_pixbuf)        g_object_unref(app.warp_pixbuf);
+    if (app.clean_crop_pixbuf)  g_object_unref(app.clean_crop_pixbuf);
     if (app.crop_pixbuf)        g_object_unref(app.crop_pixbuf);
     if (app.crop_scaled_pixbuf) g_object_unref(app.crop_scaled_pixbuf);
     g_free(app.current_filename);
