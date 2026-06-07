@@ -1113,6 +1113,15 @@ int main(int argc, char *argv[]) {
     gtk_container_add(GTK_CONTAINER(zoom_frame), app.zoom_area);
     gtk_box_pack_start(GTK_BOX(zoom_vbox), zoom_frame, FALSE, FALSE, 0);
 
+    GtkWidget *btn_rotate_left  = gtk_button_new_with_label("↺  Rotate Left");
+    GtkWidget *btn_rotate_right = gtk_button_new_with_label("↻  Rotate Right");
+    g_signal_connect(btn_rotate_left,  "clicked", G_CALLBACK(on_rotate_left),  &app);
+    g_signal_connect(btn_rotate_right, "clicked", G_CALLBACK(on_rotate_right), &app);
+    GtkWidget *rotate_hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
+    gtk_box_pack_start(GTK_BOX(rotate_hbox), btn_rotate_left,  TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(rotate_hbox), btn_rotate_right, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(zoom_vbox), rotate_hbox, FALSE, FALSE, 0);
+
     gtk_paned_pack2(GTK_PANED(source_pane), zoom_vbox, FALSE, FALSE);
 
     gtk_box_pack_start(GTK_BOX(source_vbox),
@@ -1122,16 +1131,9 @@ int main(int argc, char *argv[]) {
     gtk_widget_set_margin_end(source_bar, 4);
     gtk_widget_set_margin_top(source_bar, 4);
     gtk_widget_set_margin_bottom(source_bar, 4);
-    GtkWidget *btn_src_next = gtk_button_new_with_label("Next");
+    GtkWidget *btn_src_next = gtk_button_new_with_label("Next Image");
     g_signal_connect(btn_src_next, "clicked", G_CALLBACK(on_next_image), &app);
     gtk_box_pack_end(GTK_BOX(source_bar), btn_src_next, FALSE, FALSE, 0);
-
-    GtkWidget *btn_rotate_left  = gtk_button_new_with_label("↺  Rotate Left");
-    GtkWidget *btn_rotate_right = gtk_button_new_with_label("↻  Rotate Right");
-    g_signal_connect(btn_rotate_left,  "clicked", G_CALLBACK(on_rotate_left),  &app);
-    g_signal_connect(btn_rotate_right, "clicked", G_CALLBACK(on_rotate_right), &app);
-    gtk_box_pack_start(GTK_BOX(source_bar), btn_rotate_left,  FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(source_bar), btn_rotate_right, FALSE, FALSE, 0);
 
     gtk_box_pack_start(GTK_BOX(source_vbox), source_bar, FALSE, FALSE, 0);
 
@@ -1278,7 +1280,7 @@ int main(int argc, char *argv[]) {
     GtkWidget *btn_save_as      = gtk_button_new_with_label("Save as");
     g_signal_connect(btn_save_replace, "clicked", G_CALLBACK(on_save_replace), &app);
     g_signal_connect(btn_save_as,      "clicked", G_CALLBACK(on_save_as),      &app);
-    GtkWidget *btn_next = gtk_button_new_with_label("Next");
+    GtkWidget *btn_next = gtk_button_new_with_label("Next Image");
     g_signal_connect(btn_next, "clicked", G_CALLBACK(on_next_image), &app);
     gtk_box_pack_end(GTK_BOX(savebar), btn_next,         FALSE, FALSE, 0);
     gtk_box_pack_end(GTK_BOX(savebar),
